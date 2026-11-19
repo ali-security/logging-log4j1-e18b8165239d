@@ -1,0 +1,63 @@
+name: seal-build
+
+# log4j 1.2.17 has no upstream GitHub Actions CI. This workflow reproduces the
+# project's own Maven build (pom.xml), whose `test` phase runs the Ant suite in
+# tests/build.xml (target `runAll`) through maven-antrun-plugin. The release jar
+# targets Java 1.4 bytecode (maven-compiler-plugin source/target 1.4); Maven runs
+# on JDK 7 inside the maven:3-jdk-7 image, the newest JDK that still accepts
+# -source/-target 1.4.
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Space-separated Ant target names from tests/build.xml (e.g. 'Core SocketServer'); empty runs the full suite"
+        required: false
+        default: ""
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and test
+        env:
+          TEST_FILTER: ${{ inputs.test-filter }}
+        run: |
+          docker run --rm --platform linux/amd64 \
+            -e TEST_FILTER="$TEST_FILTER" \
+            -v "$PWD":/workdir -w /workdir \
+            maven:3-jdk-7 bash -ec '
+              java -version
+              mvn -version
+              MVN="mvn -B -Dhttps.protocols=TLSv1.2 -Dmaven.site.skip=true"
+              if [ -n "$TEST_FILTER" ]; then
+                # Compile main + prepare tests/output, then run only the named
+                # Ant targets from tests/build.xml with the same Ant 1.6.5 jars
+                # maven-antrun-plugin uses for the runAll execution.
+                $MVN clean process-classes
+                R=/root/.m2/repository
+                CP=$JAVA_HOME/lib/tools.jar
+                for j in $(find $R/ant -path "*/1.6.5/*" -name "*.jar") $R/junit/junit/3.8.1/junit-3.8.1.jar; do CP=$CP:$j; done
+                mkdir -p tests/output
+                cd tests
+                java -cp "$CP" org.apache.tools.ant.Main \
+                  -Dm2_repo=$R -Dlog4j.jar=../target/classes -Dproject.lib.home=../target \
+                  $TEST_FILTER
+              else
+                $MVN clean verify
+              fi
+            '
+
+      - name: Upload jar
+        if: ${{ inputs.test-filter == '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: log4j-jar
+          path: |
+            target/log4j-*.jar
+            !target/log4j-*-sources.jar
+            !target/log4j-*-javadoc.jar
+          if-no-files-found: error
